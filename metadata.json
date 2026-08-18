@@ -1,0 +1,6 @@
+{
+  "name": "Manwa Manager",
+  "description": "Local Manga & Manhwa manager, downloader, and offline reader with SAF storage support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

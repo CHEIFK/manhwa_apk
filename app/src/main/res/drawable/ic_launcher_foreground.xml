@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Left Manga Page -->
+    <path
+        android:fillColor="#FF2A4D"
+        android:pathData="M 52,32 C 45,30 36,30 28,34 C 27,34.5 26,35.5 26,37 L 26,73 C 26,74.5 27.5,75.5 29,75 C 36,71.5 44,71.5 52,74 Z" />
+    <!-- Right Manga Page -->
+    <path
+        android:fillColor="#FF5370"
+        android:pathData="M 56,32 C 63,30 72,30 80,34 C 81,34.5 82,35.5 82,37 L 82,73 C 82,74.5 80.5,75.5 79,75 C 72,71.5 64,71.5 56,74 Z" />
+    <!-- Center Spine & Bookmark -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 52.5,30 L 55.5,30 L 55.5,75 L 52.5,75 Z" />
+    <!-- Manga action speed lines / lightning glyph -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 58,40 L 50,51 L 55,51 L 49,63 L 60,49 L 55,49 Z" />
+</vector>
