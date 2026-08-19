@@ -19,6 +19,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
   val validateImages: StateFlow<Boolean> = prefs.validateImages
 
   fun setLibraryFolder(uri: Uri) {
+    StorageManager.clearCache()
     prefs.setLibraryUri(uri.toString())
   }
 
