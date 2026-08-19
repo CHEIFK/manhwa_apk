@@ -10,6 +10,7 @@ import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.downloader.DownloadManager
 import com.example.data.model.MangaChapter
 import com.example.data.model.MangaSeries
 import com.example.data.preferences.UserPreferences
@@ -28,6 +29,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
 
   private val context: Context get() = getApplication()
   private val prefs = UserPreferences.getInstance(context)
+  private val downloadManager = DownloadManager.getInstance(context)
 
   val libraryUri: StateFlow<String?> = prefs.libraryUri
 
@@ -57,14 +59,25 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
   private val _isLoadingChapters = MutableStateFlow(false)
   val isLoadingChapters: StateFlow<Boolean> = _isLoadingChapters.asStateFlow()
 
+  private var refreshJob: kotlinx.coroutines.Job? = null
+
   init {
     viewModelScope.launch {
       prefs.libraryUri.collect { uriStr ->
         if (uriStr != null) {
+          android.util.Log.d("ManwaManager", "Library URI updated from prefs: $uriStr")
           refreshLibrary()
         } else {
           _allSeries.value = emptyList()
         }
+      }
+    }
+
+    // Automatically synchronize library immediately when downloads complete
+    viewModelScope.launch {
+      downloadManager.downloadCompletedEvents.collect { seriesTitle ->
+        android.util.Log.d("ManwaManager", "Received downloadCompletedEvent for: $seriesTitle")
+        refreshLibraryIncremental(seriesTitle)
       }
     }
   }
@@ -74,22 +87,120 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
   }
 
   fun setLibraryFolderUri(uri: Uri) {
+    android.util.Log.d("ManwaManager", "User selected library folder: $uri")
     prefs.setLibraryUri(uri.toString())
-    refreshLibrary()
   }
 
   fun refreshLibrary() {
-    val uriStr = prefs.libraryUri.value ?: return
-    viewModelScope.launch {
+    val uriStr = prefs.libraryUri.value
+    if (uriStr == null) {
+      android.util.Log.w("ManwaManager", "refreshLibrary called with null libraryUri")
+      _isScanning.value = false
+      return
+    }
+
+    refreshJob?.cancel()
+    refreshJob = viewModelScope.launch(Dispatchers.IO) {
       _isScanning.value = true
+      val startMs = System.currentTimeMillis()
+      android.util.Log.d("ManwaManager", "Starting full library refresh for URI: $uriStr")
       try {
         val uri = Uri.parse(uriStr)
         val list = StorageManager.scanLibrary(context, uri)
         _allSeries.value = list
-      } catch (e: Exception) {
-        e.printStackTrace()
+        android.util.Log.d("ManwaManager", "Library refresh successful in ${System.currentTimeMillis() - startMs}ms, loaded ${list.size} series")
+
+        val activeSelected = _selectedSeries.value
+        if (activeSelected != null) {
+          val matching = list.find { it.id == activeSelected.id || it.title.equals(activeSelected.title, ignoreCase = true) }
+          if (matching != null) {
+            _selectedSeries.value = matching
+            val chapters = StorageManager.getChaptersForSeries(context, matching.folderUri)
+            _seriesChapters.value = chapters
+          }
+        }
+      } catch (t: Throwable) {
+        if (t !is kotlinx.coroutines.CancellationException) {
+          android.util.Log.e("ManwaManager", "Library refresh failed with exception: ${t.message}", t)
+        }
       } finally {
         _isScanning.value = false
+      }
+    }
+  }
+
+  /**
+   * Fast incremental update for a single downloaded series without full disk rescan.
+   */
+  fun refreshLibraryIncremental(seriesTitle: String) {
+    val uriStr = prefs.libraryUri.value
+    if (uriStr == null) {
+      android.util.Log.w("ManwaManager", "refreshLibraryIncremental called with null libraryUri")
+      return
+    }
+
+    viewModelScope.launch(Dispatchers.IO) {
+      val startMs = System.currentTimeMillis()
+      android.util.Log.d("ManwaManager", "Starting incremental refresh for '$seriesTitle'")
+      try {
+        val rootDoc = try {
+          DocumentFile.fromTreeUri(context, Uri.parse(uriStr))
+        } catch (e: Exception) {
+          android.util.Log.e("ManwaManager", "Failed to parse rootTreeUri in incremental refresh", e)
+          null
+        }
+
+        if (rootDoc == null) {
+          android.util.Log.w("ManwaManager", "Root DocumentFile is null in incremental refresh, falling back to full refresh")
+          refreshLibrary()
+          return@launch
+        }
+
+        val seriesDoc = StorageManager.findSeriesDirectory(rootDoc, seriesTitle)
+        if (seriesDoc == null) {
+          android.util.Log.w("ManwaManager", "Series folder for '$seriesTitle' not found via findSeriesDirectory, falling back to full refresh")
+          refreshLibrary()
+          return@launch
+        }
+
+        val updatedSeries = StorageManager.scanSingleSeries(context, seriesDoc)
+        if (updatedSeries == null) {
+          android.util.Log.w("ManwaManager", "scanSingleSeries returned null for '${seriesDoc.name}'")
+          return@launch
+        }
+
+        val currentList = _allSeries.value.toMutableList()
+        val index = currentList.indexOfFirst {
+          it.id == updatedSeries.id ||
+            it.title.equals(updatedSeries.title, ignoreCase = true) ||
+            it.title.equals(seriesTitle, ignoreCase = true)
+        }
+        if (index >= 0) {
+          currentList[index] = updatedSeries
+        } else {
+          currentList.add(updatedSeries)
+        }
+        currentList.sortBy { it.title.lowercase() }
+        _allSeries.value = currentList
+        android.util.Log.d("ManwaManager", "Incremental refresh for '$seriesTitle' completed in ${System.currentTimeMillis() - startMs}ms (total series: ${currentList.size})")
+
+        // Synchronize opened series & chapter list immediately if user has it open
+        val activeSelected = _selectedSeries.value
+        if (activeSelected != null && (
+            activeSelected.id == updatedSeries.id ||
+            activeSelected.title.equals(updatedSeries.title, ignoreCase = true) ||
+            activeSelected.title.equals(seriesTitle, ignoreCase = true)
+          )
+        ) {
+          _selectedSeries.value = updatedSeries
+          val updatedChapters = StorageManager.getChaptersForSeries(context, updatedSeries.folderUri)
+          _seriesChapters.value = updatedChapters
+          android.util.Log.d("ManwaManager", "Synchronized active selected series chapters: ${updatedChapters.size} chapters")
+        }
+      } catch (t: Throwable) {
+        if (t !is kotlinx.coroutines.CancellationException) {
+          android.util.Log.e("ManwaManager", "Incremental refresh failed for '$seriesTitle'", t)
+        }
       }
     }
   }
@@ -97,13 +208,15 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
   fun selectSeries(series: MangaSeries?) {
     _selectedSeries.value = series
     if (series != null) {
-      viewModelScope.launch {
+      viewModelScope.launch(Dispatchers.IO) {
         _isLoadingChapters.value = true
         try {
           val chapters = StorageManager.getChaptersForSeries(context, series.folderUri)
           _seriesChapters.value = chapters
-        } catch (e: Exception) {
-          e.printStackTrace()
+        } catch (t: Throwable) {
+          if (t !is kotlinx.coroutines.CancellationException) {
+            android.util.Log.e("ManwaManager", "selectSeries: failed to load chapters", t)
+          }
           _seriesChapters.value = emptyList()
         } finally {
           _isLoadingChapters.value = false

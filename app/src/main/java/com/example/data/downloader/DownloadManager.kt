@@ -16,8 +16,11 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
@@ -25,8 +28,6 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.io.InputStream
-import java.io.OutputStream
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
@@ -40,6 +41,9 @@ class DownloadManager private constructor(private val context: Context) {
 
   private val _downloadHistory = MutableStateFlow<List<DownloadTask>>(emptyList())
   val downloadHistory: StateFlow<List<DownloadTask>> = _downloadHistory.asStateFlow()
+
+  private val _downloadCompletedEvents = MutableSharedFlow<String>(replay = 1, extraBufferCapacity = 64)
+  val downloadCompletedEvents: SharedFlow<String> = _downloadCompletedEvents.asSharedFlow()
 
   private val httpClient = OkHttpClient.Builder()
     .connectTimeout(15, TimeUnit.SECONDS)
@@ -143,14 +147,26 @@ class DownloadManager private constructor(private val context: Context) {
 
     var totalChaptersCompleted = 0
 
+    // Cache chapter directories in series once to avoid repeated IPC queries
+    val existingChapters = seriesDoc.listFiles().filter { it.isDirectory }
+    val chapterMap = existingChapters.associateBy { it.name?.lowercase() ?: "" }.toMutableMap()
+
     for ((index, chapter) in task.chapters.withIndex()) {
       task.currentChapterIndex = index
       chapter.status = DownloadStatus.DOWNLOADING
       updateTask(task)
 
       try {
-        // 2. Get or create Chapter Directory
-        val chapterDoc = StorageManager.getOrCreateSubdirectory(seriesDoc, chapter.name)
+        // 2. Get or create Chapter Directory fast from local cache
+        val cleanChapterName = StorageManager.sanitizeFileName(chapter.name)
+        var chapterDoc = chapterMap[cleanChapterName.lowercase()]
+        if (chapterDoc == null || !chapterDoc.exists()) {
+          chapterDoc = seriesDoc.createDirectory(cleanChapterName)
+          if (chapterDoc != null) {
+            chapterMap[cleanChapterName.lowercase()] = chapterDoc
+          }
+        }
+
         if (chapterDoc == null) {
           chapter.status = DownloadStatus.FAILED
           chapter.errorMessage = "Could not create folder for chapter"
@@ -170,21 +186,25 @@ class DownloadManager private constructor(private val context: Context) {
         task.totalImagesEstimated += imageUrls.size
         updateTask(task)
 
-        // 4. Download images concurrently with worker concurrency limit & resume check
+        // Cache existing files in chapter folder once (eliminates 100+ IPC findFile calls)
+        val existingFiles = chapterDoc.listFiles().filter { StorageManager.isImageFile(it) }
+        val existingFilesMap = existingFiles.associateBy { it.name?.substringBeforeLast('.') ?: "" }.toMutableMap()
+
+        // 4. Download images concurrently with worker concurrency limit & fast resume check
         val downloadJobs = imageUrls.mapIndexed { pageIndex, imgUrl ->
           async(Dispatchers.IO) {
             semaphore.withPermit {
-              val pageFileName = String.format("%03d.jpg", pageIndex + 1)
-              val existingFile = chapterDoc.findFile(pageFileName)
+              val pageNumberStr = String.format("%03d", pageIndex + 1)
+              val existingFile = existingFilesMap[pageNumberStr]
 
-              // Resume check: if file exists and valid image, skip
+              // Fast in-memory resume check: if file exists and valid image, skip
               if (existingFile != null && existingFile.length() > 512) {
                 val isValid = if (validateImages) {
                   StorageManager.isValidImage(context, existingFile.uri)
                 } else true
 
                 if (isValid) {
-                  synchronized(chapter) {
+                  synchronized(task) {
                     chapter.downloadedPages++
                     task.totalImagesDownloaded++
                   }
@@ -193,20 +213,24 @@ class DownloadManager private constructor(private val context: Context) {
                 } else {
                   // Corrupt file, delete and re-download
                   existingFile.delete()
+                  synchronized(existingFilesMap) {
+                    existingFilesMap.remove(pageNumberStr)
+                  }
                 }
               }
 
-              // Download image
+              // Download image directly without O(N) findFile traversals
               val success = downloadSingleImage(
                 imgUrl = imgUrl,
                 refererUrl = chapter.url,
                 targetFolder = chapterDoc,
-                fileName = pageFileName,
+                pageNumberPrefix = pageNumberStr,
+                existingTargetFile = existingFilesMap[pageNumberStr],
                 validate = validateImages
               )
 
               if (success) {
-                synchronized(chapter) {
+                synchronized(task) {
                   chapter.downloadedPages++
                   task.totalImagesDownloaded++
                 }
@@ -224,14 +248,20 @@ class DownloadManager private constructor(private val context: Context) {
           chapter.status = DownloadStatus.COMPLETED
           totalChaptersCompleted++
           task.completedChapters = totalChaptersCompleted
+          // Invalidate series cache and emit completion event per chapter
+          StorageManager.invalidateSeriesCache(seriesDoc.uri.toString())
+          android.util.Log.d("ManwaManager", "DownloadManager: Chapter '${chapter.name}' completed for '${task.seriesTitle}'. Emitting event.")
+          _downloadCompletedEvents.tryEmit(task.seriesTitle)
         } else {
           chapter.status = DownloadStatus.FAILED
           chapter.errorMessage = "Some pages failed to download"
+          android.util.Log.w("ManwaManager", "DownloadManager: Chapter '${chapter.name}' failed to download completely")
         }
 
       } catch (e: Exception) {
         chapter.status = DownloadStatus.FAILED
         chapter.errorMessage = e.message ?: "Unknown error"
+        android.util.Log.e("ManwaManager", "DownloadManager: Exception during chapter download: ${e.message}", e)
       }
 
       updateTask(task)
@@ -245,6 +275,11 @@ class DownloadManager private constructor(private val context: Context) {
       DownloadStatus.FAILED
     }
 
+    // Invalidate series cache and emit final completion event for the series
+    StorageManager.invalidateSeriesCache(seriesDoc.uri.toString())
+    android.util.Log.d("ManwaManager", "DownloadManager: Series '${task.seriesTitle}' finished with status ${task.status}. Emitting final event.")
+    _downloadCompletedEvents.tryEmit(task.seriesTitle)
+
     _downloadHistory.value = listOf(task) + _downloadHistory.value
     _activeTask.value = null
     stopService()
@@ -254,7 +289,8 @@ class DownloadManager private constructor(private val context: Context) {
     imgUrl: String,
     refererUrl: String,
     targetFolder: DocumentFile,
-    fileName: String,
+    pageNumberPrefix: String,
+    existingTargetFile: DocumentFile?,
     validate: Boolean
   ): Boolean = withContext(Dispatchers.IO) {
     var attempts = 0
@@ -271,39 +307,40 @@ class DownloadManager private constructor(private val context: Context) {
           .build()
 
         val response = httpClient.newCall(request).execute()
-        if (!response.isSuccessful) {
-          response.close()
-          continue
-        }
-
-        val mimeType = response.header("Content-Type") ?: "image/jpeg"
-        val ext = when {
-          mimeType.contains("png") -> "png"
-          mimeType.contains("webp") -> "webp"
-          mimeType.contains("avif") -> "avif"
-          else -> "jpg"
-        }
-        val actualFileName = fileName.substringBeforeLast('.') + ".$ext"
-
-        val targetFile = StorageManager.getOrCreateFile(targetFolder, mimeType, actualFileName)
-          ?: return@withContext false
-
-        response.body?.byteStream()?.use { input ->
-          context.contentResolver.openOutputStream(targetFile.uri, "w")?.use { output ->
-            input.copyTo(output)
-            output.flush()
+        response.use { res ->
+          if (!res.isSuccessful) {
+            return@use
           }
-        }
 
-        if (validate) {
-          val valid = StorageManager.isValidImage(context, targetFile.uri)
-          if (!valid) {
-            targetFile.delete()
-            continue
+          val mimeType = res.header("Content-Type") ?: "image/jpeg"
+          val ext = when {
+            mimeType.contains("png") -> "png"
+            mimeType.contains("webp") -> "webp"
+            mimeType.contains("avif") -> "avif"
+            else -> "jpg"
           }
-        }
+          val actualFileName = "$pageNumberPrefix.$ext"
 
-        return@withContext true
+          val targetFile = existingTargetFile ?: targetFolder.createFile(mimeType, actualFileName)
+            ?: return@withContext false
+
+          res.body?.byteStream()?.use { input ->
+            context.contentResolver.openOutputStream(targetFile.uri, "w")?.use { output ->
+              input.copyTo(output)
+              output.flush()
+            }
+          }
+
+          if (validate) {
+            val valid = StorageManager.isValidImage(context, targetFile.uri)
+            if (!valid) {
+              targetFile.delete()
+              return@use
+            }
+          }
+
+          return@withContext true
+        }
       } catch (e: Exception) {
         if (attempts >= maxAttempts) {
           return@withContext false
@@ -314,7 +351,11 @@ class DownloadManager private constructor(private val context: Context) {
   }
 
   private fun updateTask(task: DownloadTask) {
-    _activeTask.value = task.copy()
+    synchronized(task) {
+      _activeTask.value = task.copy(
+        chapters = task.chapters.map { it.copy() }
+      )
+    }
   }
 
   companion object {

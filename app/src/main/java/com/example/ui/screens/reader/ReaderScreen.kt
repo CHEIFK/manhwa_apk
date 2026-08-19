@@ -94,6 +94,12 @@ fun ReaderScreen(
 
   val listState = rememberLazyListState()
 
+  androidx.compose.runtime.LaunchedEffect(currentChapter?.id) {
+    if (pages.isNotEmpty()) {
+      listState.scrollToItem(0)
+    }
+  }
+
   val currentPageNumber by remember {
     derivedStateOf {
       if (pages.isEmpty()) 0 else (listState.firstVisibleItemIndex + 1).coerceAtMost(pages.size)
