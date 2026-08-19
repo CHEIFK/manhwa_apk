@@ -10,6 +10,8 @@ import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.db.AppDatabase
+import com.example.data.db.toDomain
 import com.example.data.downloader.DownloadManager
 import com.example.data.model.MangaChapter
 import com.example.data.model.MangaSeries
@@ -59,6 +61,9 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
   private val _isLoadingChapters = MutableStateFlow(false)
   val isLoadingChapters: StateFlow<Boolean> = _isLoadingChapters.asStateFlow()
 
+  private val _errorMessage = MutableStateFlow<String?>(null)
+  val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
+
   private var refreshJob: kotlinx.coroutines.Job? = null
 
   init {
@@ -66,6 +71,9 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
       prefs.libraryUri.collect { uriStr ->
         if (uriStr != null) {
           android.util.Log.d("ManwaManager", "Library URI updated from prefs: $uriStr")
+          // 1. Immediately load cached data from Room for instant UI display
+          loadCachedLibrary()
+          // 2. Perform lightweight background synchronization with SAF
           refreshLibrary()
         } else {
           _allSeries.value = emptyList()
@@ -91,6 +99,30 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     prefs.setLibraryUri(uri.toString())
   }
 
+  fun clearError() {
+    _errorMessage.value = null
+  }
+
+  /**
+   * Loads series instantly from the local Room database cache without blocking or calling SAF.
+   */
+  private fun loadCachedLibrary() {
+    viewModelScope.launch(Dispatchers.IO) {
+      try {
+        val cached = StorageManager.getCachedSeriesList(context)
+        if (cached.isNotEmpty()) {
+          _allSeries.value = cached
+          android.util.Log.d("ManwaManager", "Loaded ${cached.size} series immediately from local cache")
+        }
+      } catch (e: Exception) {
+        android.util.Log.e("ManwaManager", "Failed to load cached library", e)
+      }
+    }
+  }
+
+  /**
+   * Performs lightweight background sync: compares timestamps and updates only changed/new/deleted entries.
+   */
   fun refreshLibrary() {
     val uriStr = prefs.libraryUri.value
     if (uriStr == null) {
@@ -103,12 +135,12 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     refreshJob = viewModelScope.launch(Dispatchers.IO) {
       _isScanning.value = true
       val startMs = System.currentTimeMillis()
-      android.util.Log.d("ManwaManager", "Starting full library refresh for URI: $uriStr")
+      android.util.Log.d("ManwaManager", "Starting lightweight background library sync for URI: $uriStr")
       try {
         val uri = Uri.parse(uriStr)
-        val list = StorageManager.scanLibrary(context, uri)
+        val list = StorageManager.syncLibrary(context, uri)
         _allSeries.value = list
-        android.util.Log.d("ManwaManager", "Library refresh successful in ${System.currentTimeMillis() - startMs}ms, loaded ${list.size} series")
+        android.util.Log.d("ManwaManager", "Library sync successful in ${System.currentTimeMillis() - startMs}ms, loaded ${list.size} series")
 
         val activeSelected = _selectedSeries.value
         if (activeSelected != null) {
@@ -121,7 +153,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         }
       } catch (t: Throwable) {
         if (t !is kotlinx.coroutines.CancellationException) {
-          android.util.Log.e("ManwaManager", "Library refresh failed with exception: ${t.message}", t)
+          android.util.Log.e("ManwaManager", "Library sync failed with exception: ${t.message}", t)
         }
       } finally {
         _isScanning.value = false
@@ -133,69 +165,59 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
    * Fast incremental update for a single downloaded series without full disk rescan.
    */
   fun refreshLibraryIncremental(seriesTitle: String) {
-    val uriStr = prefs.libraryUri.value
-    if (uriStr == null) {
-      android.util.Log.w("ManwaManager", "refreshLibraryIncremental called with null libraryUri")
-      return
-    }
+    val uriStr = prefs.libraryUri.value ?: return
 
     viewModelScope.launch(Dispatchers.IO) {
       val startMs = System.currentTimeMillis()
       android.util.Log.d("ManwaManager", "Starting incremental refresh for '$seriesTitle'")
       try {
-        val rootDoc = try {
-          DocumentFile.fromTreeUri(context, Uri.parse(uriStr))
-        } catch (e: Exception) {
-          android.util.Log.e("ManwaManager", "Failed to parse rootTreeUri in incremental refresh", e)
-          null
-        }
+        val db = AppDatabase.getInstance(context)
+        val dao = db.mangaDao()
 
-        if (rootDoc == null) {
-          android.util.Log.w("ManwaManager", "Root DocumentFile is null in incremental refresh, falling back to full refresh")
-          refreshLibrary()
-          return@launch
-        }
+        // 1. Check if series entity is already in Room DB
+        val allSeriesFromDb = dao.getAllSeries().map { it.toDomain() }
+        var updatedSeries = allSeriesFromDb.find { it.title.equals(seriesTitle, ignoreCase = true) }
 
-        val seriesDoc = StorageManager.findSeriesDirectory(rootDoc, seriesTitle)
-        if (seriesDoc == null) {
-          android.util.Log.w("ManwaManager", "Series folder for '$seriesTitle' not found via findSeriesDirectory, falling back to full refresh")
-          refreshLibrary()
-          return@launch
-        }
-
-        val updatedSeries = StorageManager.scanSingleSeries(context, seriesDoc)
         if (updatedSeries == null) {
-          android.util.Log.w("ManwaManager", "scanSingleSeries returned null for '${seriesDoc.name}'")
-          return@launch
+          // If not in DB yet, locate and scan this single series folder
+          val rootDoc = DocumentFile.fromTreeUri(context, Uri.parse(uriStr))
+          if (rootDoc != null) {
+            val seriesDoc = StorageManager.findSeriesDirectory(rootDoc, seriesTitle)
+            if (seriesDoc != null) {
+              updatedSeries = StorageManager.scanSingleSeries(context, seriesDoc)
+            }
+          }
         }
 
-        val currentList = _allSeries.value.toMutableList()
-        val index = currentList.indexOfFirst {
-          it.id == updatedSeries.id ||
-            it.title.equals(updatedSeries.title, ignoreCase = true) ||
-            it.title.equals(seriesTitle, ignoreCase = true)
-        }
-        if (index >= 0) {
-          currentList[index] = updatedSeries
-        } else {
-          currentList.add(updatedSeries)
-        }
-        currentList.sortBy { it.title.lowercase() }
-        _allSeries.value = currentList
-        android.util.Log.d("ManwaManager", "Incremental refresh for '$seriesTitle' completed in ${System.currentTimeMillis() - startMs}ms (total series: ${currentList.size})")
+        if (updatedSeries != null) {
+          val currentList = _allSeries.value.toMutableList()
+          val index = currentList.indexOfFirst {
+            it.id == updatedSeries.id ||
+              it.title.equals(updatedSeries.title, ignoreCase = true) ||
+              it.title.equals(seriesTitle, ignoreCase = true)
+          }
+          if (index >= 0) {
+            currentList[index] = updatedSeries
+          } else {
+            currentList.add(updatedSeries)
+          }
+          currentList.sortBy { it.title.lowercase() }
+          _allSeries.value = currentList
+          android.util.Log.d("ManwaManager", "Incremental refresh for '$seriesTitle' completed in ${System.currentTimeMillis() - startMs}ms (total series: ${currentList.size})")
 
-        // Synchronize opened series & chapter list immediately if user has it open
-        val activeSelected = _selectedSeries.value
-        if (activeSelected != null && (
-            activeSelected.id == updatedSeries.id ||
-            activeSelected.title.equals(updatedSeries.title, ignoreCase = true) ||
-            activeSelected.title.equals(seriesTitle, ignoreCase = true)
-          )
-        ) {
-          _selectedSeries.value = updatedSeries
-          val updatedChapters = StorageManager.getChaptersForSeries(context, updatedSeries.folderUri)
-          _seriesChapters.value = updatedChapters
-          android.util.Log.d("ManwaManager", "Synchronized active selected series chapters: ${updatedChapters.size} chapters")
+          // Synchronize opened series & chapter list immediately if user has it open
+          val activeSelected = _selectedSeries.value
+          if (activeSelected != null && (
+              activeSelected.id == updatedSeries.id ||
+              activeSelected.title.equals(updatedSeries.title, ignoreCase = true) ||
+              activeSelected.title.equals(seriesTitle, ignoreCase = true)
+            )
+          ) {
+            _selectedSeries.value = updatedSeries
+            val updatedChapters = StorageManager.getChaptersForSeries(context, updatedSeries.folderUri)
+            _seriesChapters.value = updatedChapters
+            android.util.Log.d("ManwaManager", "Synchronized active selected series chapters: ${updatedChapters.size} chapters")
+          }
         }
       } catch (t: Throwable) {
         if (t !is kotlinx.coroutines.CancellationException) {
@@ -205,25 +227,96 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     }
   }
 
+  /**
+   * Instant opening of series & chapter metadata from Room cache.
+   * Eliminates UI freeze by loading indexed chapters instantly (< 1ms) and delegating sync to background.
+   */
   fun selectSeries(series: MangaSeries?) {
     _selectedSeries.value = series
-    if (series != null) {
-      viewModelScope.launch(Dispatchers.IO) {
-        _isLoadingChapters.value = true
-        try {
-          val chapters = StorageManager.getChaptersForSeries(context, series.folderUri)
+    if (series == null) {
+      _seriesChapters.value = emptyList()
+      _isLoadingChapters.value = false
+      return
+    }
+
+    val seriesUriStr = series.folderUri.toString()
+    viewModelScope.launch(Dispatchers.IO) {
+      val db = AppDatabase.getInstance(context)
+      val dao = db.mangaDao()
+
+      // 1. Fast cache query (0 SAF calls, instant UI display)
+      val cachedChapters = try {
+        dao.getChaptersForSeries(seriesUriStr)
+      } catch (e: Exception) {
+        emptyList()
+      }
+
+      if (cachedChapters.isNotEmpty()) {
+        val domainChapters = cachedChapters.map { it.toDomain() }
+        withContext(Dispatchers.Main) {
+          _seriesChapters.value = domainChapters
+          _isLoadingChapters.value = false
+        }
+      } else {
+        withContext(Dispatchers.Main) {
+          _isLoadingChapters.value = true
+        }
+        val chapters = StorageManager.getChaptersForSeriesFast(context, series.folderUri, series.title)
+        withContext(Dispatchers.Main) {
           _seriesChapters.value = chapters
-        } catch (t: Throwable) {
-          if (t !is kotlinx.coroutines.CancellationException) {
-            android.util.Log.e("ManwaManager", "selectSeries: failed to load chapters", t)
-          }
-          _seriesChapters.value = emptyList()
-        } finally {
           _isLoadingChapters.value = false
         }
       }
-    } else {
-      _seriesChapters.value = emptyList()
+
+      // 2. Non-blocking background sync for updated page counts
+      StorageManager.syncSingleSeriesInBackground(context, series.folderUri, series.title) { updatedChapters, updatedSeries ->
+        if (_selectedSeries.value?.id == series.id) {
+          viewModelScope.launch(Dispatchers.Main) {
+            if (updatedChapters.isNotEmpty()) {
+              _seriesChapters.value = updatedChapters
+            }
+            if (updatedSeries != null) {
+              _selectedSeries.value = updatedSeries
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Deletes the selected series and all its chapters from SAF storage and local cache immediately.
+   */
+  fun deleteSeries(series: MangaSeries, onComplete: ((Boolean) -> Unit)? = null) {
+    viewModelScope.launch(Dispatchers.IO) {
+      android.util.Log.d("ManwaManager", "Deleting series: ${series.title} (${series.folderUri})")
+      try {
+        // 1. Immediately update UI state
+        withContext(Dispatchers.Main) {
+          if (_selectedSeries.value?.id == series.id) {
+            _selectedSeries.value = null
+            _seriesChapters.value = emptyList()
+          }
+          _allSeries.value = _allSeries.value.filter { it.id != series.id }
+        }
+
+        // 2. Delete from SAF storage & Room database
+        val deleted = StorageManager.deleteSeriesFolder(context, series.folderUri)
+        android.util.Log.d("ManwaManager", "deleteSeries result for ${series.title}: $deleted")
+
+        withContext(Dispatchers.Main) {
+          if (!deleted) {
+            _errorMessage.value = "Failed to completely delete folder for ${series.title}. Please check storage permissions."
+          }
+          onComplete?.invoke(deleted)
+        }
+      } catch (e: Exception) {
+        android.util.Log.e("ManwaManager", "Error deleting series ${series.title}", e)
+        withContext(Dispatchers.Main) {
+          _errorMessage.value = "Error deleting ${series.title}: ${e.message}"
+          onComplete?.invoke(false)
+        }
+      }
     }
   }
 
@@ -261,8 +354,12 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
           }
         }
 
+        // Rescan and update database
+        StorageManager.syncLibrary(context, Uri.parse(uriStr))
+        val updatedList = StorageManager.getCachedSeriesList(context)
+
         withContext(Dispatchers.Main) {
-          refreshLibrary()
+          _allSeries.value = updatedList
         }
       } catch (e: Exception) {
         e.printStackTrace()

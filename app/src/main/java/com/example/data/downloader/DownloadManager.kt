@@ -5,6 +5,9 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import androidx.documentfile.provider.DocumentFile
+import com.example.data.db.AppDatabase
+import com.example.data.db.MangaChapterEntity
+import com.example.data.db.MangaSeriesEntity
 import com.example.data.model.ChapterDownloadItem
 import com.example.data.model.DownloadStatus
 import com.example.data.model.DownloadTask
@@ -186,7 +189,7 @@ class DownloadManager private constructor(private val context: Context) {
         task.totalImagesEstimated += imageUrls.size
         updateTask(task)
 
-        // Cache existing files in chapter folder once (eliminates 100+ IPC findFile calls)
+        // Cache existing files in chapter folder once
         val existingFiles = chapterDoc.listFiles().filter { StorageManager.isImageFile(it) }
         val existingFilesMap = existingFiles.associateBy { it.name?.substringBeforeLast('.') ?: "" }.toMutableMap()
 
@@ -248,6 +251,44 @@ class DownloadManager private constructor(private val context: Context) {
           chapter.status = DownloadStatus.COMPLETED
           totalChaptersCompleted++
           task.completedChapters = totalChaptersCompleted
+
+          // Update chapter and series metadata directly in local Room cache immediately
+          try {
+            val db = AppDatabase.getInstance(context)
+            val dao = db.mangaDao()
+            val chLastModified = chapterDoc.lastModified()
+            val chEntity = MangaChapterEntity(
+              uri = chapterDoc.uri.toString(),
+              seriesUri = seriesDoc.uri.toString(),
+              name = chapter.name,
+              chapterNumber = StorageManager.extractChapterNumber(chapter.name),
+              pageCount = chapter.downloadedPages,
+              lastModified = chLastModified
+            )
+            dao.insertChapter(chEntity)
+
+            val currentChapters = dao.getChaptersForSeries(seriesDoc.uri.toString())
+            val totalPagesSum = currentChapters.sumOf { it.pageCount }
+            val existingSeries = dao.getSeriesByUri(seriesDoc.uri.toString())
+            val firstCover = existingSeries?.coverUri ?: run {
+              val firstChDoc = DocumentFile.fromTreeUri(context, chapterDoc.uri) ?: chapterDoc
+              firstChDoc.listFiles().firstOrNull { StorageManager.isImageFile(it) }?.uri?.toString()
+            }
+
+            val seriesEntity = MangaSeriesEntity(
+              uri = seriesDoc.uri.toString(),
+              title = task.seriesTitle,
+              coverUri = firstCover,
+              chapterCount = currentChapters.size,
+              totalPages = totalPagesSum,
+              lastModified = seriesDoc.lastModified(),
+              statusTag = "LOCAL"
+            )
+            dao.insertSeries(seriesEntity)
+          } catch (e: Exception) {
+            android.util.Log.e("ManwaManager", "DownloadManager: Failed to update Room cache on chapter completion", e)
+          }
+
           // Invalidate series cache and emit completion event per chapter
           StorageManager.invalidateSeriesCache(seriesDoc.uri.toString())
           android.util.Log.d("ManwaManager", "DownloadManager: Chapter '${chapter.name}' completed for '${task.seriesTitle}'. Emitting event.")

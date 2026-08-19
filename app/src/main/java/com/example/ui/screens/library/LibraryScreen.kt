@@ -32,12 +32,15 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -74,6 +77,7 @@ import coil.request.ImageRequest
 import com.example.data.model.MangaChapter
 import com.example.data.model.MangaSeries
 import com.example.data.storage.StorageManager
+import com.example.ui.theme.EditorialAccentCrimson
 import com.example.ui.theme.EditorialAccentGreen
 import com.example.ui.theme.EditorialBg
 import com.example.ui.theme.EditorialOnPrimary
@@ -81,6 +85,7 @@ import com.example.ui.theme.EditorialOutline
 import com.example.ui.theme.EditorialOutlineVariant
 import com.example.ui.theme.EditorialPrimary
 import com.example.ui.theme.EditorialPrimaryContainer
+import com.example.ui.theme.EditorialSecondary
 import com.example.ui.theme.EditorialSurface
 import com.example.ui.theme.EditorialTextDim
 import com.example.ui.theme.EditorialTextPrimary
@@ -102,8 +107,10 @@ fun LibraryScreen(
   val selectedSeries by viewModel.selectedSeries.collectAsState()
   val seriesChapters by viewModel.seriesChapters.collectAsState()
   val isLoadingChapters by viewModel.isLoadingChapters.collectAsState()
+  val errorMessage by viewModel.errorMessage.collectAsState()
 
   var isSearchVisible by remember { mutableStateOf(false) }
+  var seriesToDelete by remember { mutableStateOf<MangaSeries?>(null) }
 
   val folderPickerLauncher = rememberLauncherForActivityResult(
     contract = ActivityResultContracts.OpenDocumentTree()
@@ -118,6 +125,56 @@ fun LibraryScreen(
       }
       viewModel.setLibraryFolderUri(uri)
     }
+  }
+
+  // Deletion Confirmation Dialog
+  if (seriesToDelete != null) {
+    val target = seriesToDelete!!
+    AlertDialog(
+      onDismissRequest = { seriesToDelete = null },
+      title = {
+        Text(
+          text = "Delete Series",
+          fontWeight = FontWeight.Bold,
+          fontSize = 18.sp,
+          color = EditorialTextPrimary
+        )
+      },
+      text = {
+        Text(
+          text = "Are you sure you want to delete \"${target.title}\"?\n\nThis will permanently remove all downloaded chapters and image files from your library folder.",
+          fontSize = 14.sp,
+          color = EditorialTextSecondary
+        )
+      },
+      confirmButton = {
+        Button(
+          onClick = {
+            viewModel.deleteSeries(target)
+            seriesToDelete = null
+          },
+          colors = ButtonDefaults.buttonColors(
+            containerColor = EditorialAccentCrimson,
+            contentColor = Color.White
+          ),
+          shape = RoundedCornerShape(8.dp),
+          modifier = Modifier.testTag("confirm_delete_series_button")
+        ) {
+          Text("Delete", fontWeight = FontWeight.Bold)
+        }
+      },
+      dismissButton = {
+        TextButton(
+          onClick = { seriesToDelete = null },
+          modifier = Modifier.testTag("cancel_delete_series_button")
+        ) {
+          Text("Cancel", color = EditorialTextSecondary)
+        }
+      },
+      containerColor = EditorialSurface,
+      shape = RoundedCornerShape(16.dp),
+      modifier = Modifier.testTag("delete_confirmation_dialog")
+    )
   }
 
   Column(
@@ -223,6 +280,38 @@ fun LibraryScreen(
           .padding(horizontal = 24.dp, vertical = 6.dp)
           .testTag("search_input_field")
       )
+    }
+
+    // Error Alert Banner
+    if (errorMessage != null) {
+      Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = Color(0xFF331418),
+        border = androidx.compose.foundation.BorderStroke(1.dp, EditorialAccentCrimson.copy(alpha = 0.5f)),
+        modifier = Modifier
+          .fillMaxWidth()
+          .padding(horizontal = 24.dp, vertical = 6.dp)
+      ) {
+        Row(
+          modifier = Modifier.padding(14.dp),
+          verticalAlignment = Alignment.CenterVertically,
+          horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+          Icon(imageVector = Icons.Default.ErrorOutline, contentDescription = null, tint = EditorialAccentCrimson)
+          Text(
+            text = errorMessage ?: "",
+            fontSize = 12.sp,
+            color = EditorialTextPrimary,
+            modifier = Modifier.weight(1f)
+          )
+          IconButton(
+            onClick = { viewModel.clearError() },
+            modifier = Modifier.size(24.dp)
+          ) {
+            Icon(imageVector = Icons.Default.Close, contentDescription = "Dismiss", tint = EditorialTextSecondary)
+          }
+        }
+      }
     }
 
     // Active Storage Card
@@ -458,7 +547,8 @@ fun LibraryScreen(
         items(filteredSeries, key = { it.id }) { series ->
           SeriesCard(
             series = series,
-            onClick = { viewModel.selectSeries(series) }
+            onClick = { viewModel.selectSeries(series) },
+            onDeleteClick = { seriesToDelete = series }
           )
         }
       }
@@ -530,6 +620,21 @@ fun LibraryScreen(
               modifier = Modifier.padding(top = 2.dp)
             )
           }
+
+          // Delete Series button inside bottom sheet
+          IconButton(
+            onClick = {
+              seriesToDelete = selectedSeries
+            },
+            modifier = Modifier.testTag("sheet_delete_series_button")
+          ) {
+            Icon(
+              imageVector = Icons.Default.DeleteOutline,
+              contentDescription = "Delete Series",
+              tint = EditorialAccentCrimson,
+              modifier = Modifier.size(24.dp)
+            )
+          }
         }
 
         Text(
@@ -589,6 +694,7 @@ fun LibraryScreen(
 fun SeriesCard(
   series: MangaSeries,
   onClick: () -> Unit,
+  onDeleteClick: () -> Unit,
   modifier: Modifier = Modifier
 ) {
   val context = LocalContext.current
@@ -643,6 +749,26 @@ fun SeriesCard(
             )
           )
       )
+
+      // Top right delete button overlay
+      Box(
+        modifier = Modifier
+          .align(Alignment.TopEnd)
+          .padding(8.dp)
+          .size(32.dp)
+          .clip(CircleShape)
+          .background(Color(0xBB111318))
+          .clickable(onClick = onDeleteClick)
+          .testTag("delete_series_button_${series.title.replace(" ", "_")}"),
+        contentAlignment = Alignment.Center
+      ) {
+        Icon(
+          imageVector = Icons.Default.DeleteOutline,
+          contentDescription = "Delete ${series.title}",
+          tint = EditorialAccentCrimson,
+          modifier = Modifier.size(18.dp)
+        )
+      }
 
       // Tag badge
       Box(

@@ -9,6 +9,7 @@ import com.example.data.model.MangaChapter
 import com.example.data.model.MangaPage
 import com.example.data.preferences.UserPreferences
 import com.example.data.storage.StorageManager
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -47,7 +48,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     _seriesTitle.value = title
     _isLoading.value = true
 
-    viewModelScope.launch {
+    viewModelScope.launch(Dispatchers.IO) {
       try {
         val sUri = Uri.parse(seriesUri)
         val chapters = StorageManager.getChaptersForSeries(context, sUri)
@@ -57,10 +58,13 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
           ?: chapters.firstOrNull()
 
         _currentChapter.value = targetChapter
-        _pages.value = targetChapter?.pages ?: emptyList()
 
         if (targetChapter != null) {
+          val chapterPages = StorageManager.getPagesForChapter(context, targetChapter.folderUri)
+          _pages.value = chapterPages
           prefs.setLastReadChapter(seriesUri, targetChapter.id)
+        } else {
+          _pages.value = emptyList()
         }
       } catch (e: Exception) {
         e.printStackTrace()
@@ -100,7 +104,17 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
 
   fun switchChapter(chapter: MangaChapter) {
     _currentChapter.value = chapter
-    _pages.value = chapter.pages
-    seriesUriStr?.let { prefs.setLastReadChapter(it, chapter.id) }
+    _isLoading.value = true
+    viewModelScope.launch(Dispatchers.IO) {
+      try {
+        val chapterPages = StorageManager.getPagesForChapter(context, chapter.folderUri)
+        _pages.value = chapterPages
+        seriesUriStr?.let { prefs.setLastReadChapter(it, chapter.id) }
+      } catch (e: Exception) {
+        e.printStackTrace()
+      } finally {
+        _isLoading.value = false
+      }
+    }
   }
 }
