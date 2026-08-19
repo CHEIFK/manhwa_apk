@@ -8,15 +8,24 @@ This contains everything you need to run your app locally.
 
 View your app in AI Studio: https://ai.studio/apps/c49de930-bd81-43b5-91df-4b976d357170
 
-## Run Locally
+## CI/CD & Automated GitHub Actions Build
 
-**Prerequisites:**  [Android Studio](https://developer.android.com/studio)
+An automated GitHub Actions workflow is pre-configured at [`.github/workflows/build-android.yml`](.github/workflows/build-android.yml).
 
+Every push to `main` or `master` (and pull requests) will automatically trigger a build in the cloud and generate the APK as a downloadable artifact.
 
-1. Open Android Studio
-2. Select **Open** and choose the directory containing this project
-3. Allow Android Studio to fix any incompatibilities as it imports the project.
-4. Create a file named `.env` in the project directory and set `GEMINI_API_KEY` in that file to your Gemini API key (see `.env.example` for an example)
-5. Remove this line from the app's `build.gradle.kts` file: `signingConfig = signingConfigs.getByName("debugConfig")`
-6. Run the app on an emulator or physical device
-7. If you have already published your app in AI Studio, please [request upload key reset](https://support.google.com/googleplay/android-developer/answer/9842756#zippy=%2Crequest-an-upload-key-reset) in Google Play Console.
+### Configuring Signing in GitHub Repository Secrets
+
+To produce a signed release APK automatically in GitHub Actions, configure the following secrets in your repository (**Settings** -> **Secrets and variables** -> **Actions**):
+
+| Secret Name | Description | Example / Note |
+|---|---|---|
+| `KEYSTORE_BASE64` | Base64-encoded keystore file | Run `base64 -w 0 your-keystore.jks` and paste the output string |
+| `STORE_PASSWORD` | Keystore password | Password used when creating keystore |
+| `KEY_ALIAS` | Key alias name | e.g. `upload` or `key0` |
+| `KEY_PASSWORD` | Key password | Password for the key (defaults to store password if identical) |
+| `GEMINI_API_KEY` | *(Optional)* Gemini API Key | Automatically populated into `.env` |
+| `GOOGLE_SERVICES_JSON` | *(Optional)* Firebase Config | Base content of `google-services.json` |
+
+> **Note:** If no signing secrets are configured, GitHub Actions will still succeed and build an unsigned release APK artifact (`app-release-unsigned.apk`).
+

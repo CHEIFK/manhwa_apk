@@ -25,13 +25,31 @@ android {
 
   signingConfigs {
     create("release") {
-      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
+      val keystorePath = System.getenv("KEYSTORE_PATH")
+        ?: System.getenv("KEYSTORE_FILE")
+        ?: (project.findProperty("KEYSTORE_PATH") as? String)
+        ?: (project.findProperty("KEYSTORE_FILE") as? String)
+        ?: "${rootDir}/my-upload-key.jks"
       val keystoreFile = file(keystorePath)
-      if (keystoreFile.exists()) {
+
+      val storePasswordEnv = System.getenv("STORE_PASSWORD")
+        ?: System.getenv("KEYSTORE_PASSWORD")
+        ?: (project.findProperty("STORE_PASSWORD") as? String)
+        ?: (project.findProperty("KEYSTORE_PASSWORD") as? String)
+
+      val keyAliasEnv = System.getenv("KEY_ALIAS")
+        ?: (project.findProperty("KEY_ALIAS") as? String)
+        ?: "upload"
+
+      val keyPasswordEnv = System.getenv("KEY_PASSWORD")
+        ?: (project.findProperty("KEY_PASSWORD") as? String)
+        ?: storePasswordEnv
+
+      if (keystoreFile.exists() && !storePasswordEnv.isNullOrBlank()) {
         storeFile = keystoreFile
-        storePassword = System.getenv("STORE_PASSWORD")
-        keyAlias = System.getenv("KEY_ALIAS") ?: "upload"
-        keyPassword = System.getenv("KEY_PASSWORD")
+        storePassword = storePasswordEnv
+        keyAlias = keyAliasEnv
+        keyPassword = keyPasswordEnv
       }
     }
     create("debugConfig") {
@@ -50,9 +68,9 @@ android {
       isCrunchPngs = false
       isMinifyEnabled = false
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
-      if (file(keystorePath).exists()) {
-        signingConfig = signingConfigs.getByName("release")
+      val releaseSigning = signingConfigs.getByName("release")
+      if (releaseSigning.storeFile != null && releaseSigning.storeFile?.exists() == true) {
+        signingConfig = releaseSigning
       }
     }
     debug {
